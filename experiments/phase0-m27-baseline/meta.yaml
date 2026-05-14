@@ -1,0 +1,35 @@
+run_id: phase0-m27-baseline
+purpose: >
+  Phase 0 smoke — verify the M2.7 registration and the orvl pipeline can run
+  end-to-end against the chosen subject model. NOT a usable baseline number;
+  judge auth was not in env so all 12 judge calls returned score=0.
+agent: opencode
+subject_model: minimax-cn-coding-plan/MiniMax-M2.7
+prompt: default (no override; opencode/default.txt strict variant)
+task: sst-opencode-formatting
+episode_count: 1
+started_at_utc: 2026-05-14T07:53:37Z
+finished_at_utc: 2026-05-14T07:58:11Z
+duration_seconds: 203
+agent_actions: 5
+agent_usage:
+  input_tokens: 297
+  output_tokens: 76
+  cost_usd: 0.00  # subscription billing, not zero work
+final_score: 0.000
+base_score: 0.000
+variance_penalty: 0.000
+verdict: invalid
+verdict_reason: |
+  Score=0 reflects bench wiring gaps, not model behavior:
+    1. judges hardcoded to opencode/* zen models in src/judges.ts;
+       OPENCODE_API_KEY unset in env, so each of 12 judge calls threw
+       "Missing OpenCode Zen API key" and was caught into score=0.
+    2. cosmetic log "Failed to check final agent diff: Failed with exit code 1"
+       from src/eval.ts:215 — Bun.$ ShellError exposes `exitCode`, code checks
+       `status`. Run still completed; diff was generated and judges did try.
+  Both gaps documented in memory project_bench_runtime_gaps.md.
+opencode_bench_sha: 3c8f96596d3616c64b67c01375bf6d86c5907ca3
+artifacts:
+  - orvl.log: stdout capture from `bun run cli.ts opencode --model minimax-cn-coding-plan/MiniMax-M2.7 --task sst-opencode-formatting`
+  - started_at.txt: human-readable run-start timestamp
