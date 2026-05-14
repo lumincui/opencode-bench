@@ -11,7 +11,7 @@ set -e
 
 BENCH_DIR="/Users/lumin/opencode-optimize-workspace/opencode-bench"
 EXP_DIR="/Users/lumin/opencode-optimize-workspace/experiments"
-MODEL="minimax-cn/MiniMax-M2.7"
+MODEL="minimax-cn-coding-plan/MiniMax-M2.7"
 TASKS=("sst-opencode-formatting" "sst-opencode-session-rename" "helix-db-cli-update")
 ARMS=("A" "B" "C" "D" "E" "F" "Z" "baseline")
 

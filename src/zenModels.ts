@@ -15,7 +15,8 @@ const DEFAULT_BASE_URL = "https://opencode.ai/zen/v1";
 const OPENCODE_PREFIX = "opencode/";
 const API_KEY_ENV_VARS = ["OPENCODE_API_KEY"];
 
-const MINIMAX_PREFIX = "minimax-cn/";
+const MINIMAX_PREFIX = "minimax-cn-coding-plan/";
+const MINIMAX_AUTH_KEY = "minimax-cn-coding-plan";
 const MINIMAX_BASE_URL = "https://api.minimaxi.com/anthropic/v1";
 const MINIMAX_AUTH_PATH = path.join(os.homedir(), ".local", "share", "opencode", "auth.json");
 
@@ -31,14 +32,14 @@ function getMinimaxKey(): string {
   } catch (err) {
     assert(
       false,
-      `Cannot read opencode auth file at ${MINIMAX_AUTH_PATH}; set MINIMAX_API_KEY env var or run 'opencode auth login minimax-cn' (${(err as Error).message})`,
+      `Cannot read opencode auth file at ${MINIMAX_AUTH_PATH}; set MINIMAX_API_KEY env var or run 'opencode auth login ${MINIMAX_AUTH_KEY}' (${(err as Error).message})`,
     );
   }
   const auth = JSON.parse(raw) as Record<string, { type?: string; key?: string }>;
-  const entry = auth["minimax-cn"];
+  const entry = auth[MINIMAX_AUTH_KEY];
   assert(
     entry?.type === "api" && typeof entry.key === "string" && entry.key.length > 0,
-    `auth.json has no usable 'minimax-cn' api credential; run 'opencode auth login minimax-cn' or set MINIMAX_API_KEY`,
+    `auth.json has no usable '${MINIMAX_AUTH_KEY}' api credential; run 'opencode auth login ${MINIMAX_AUTH_KEY}' or set MINIMAX_API_KEY`,
   );
   return entry.key as string;
 }
