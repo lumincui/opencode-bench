@@ -15,7 +15,6 @@ const opencodeConfig = {
     webfetch: "allow",
     external_directory: "allow",
   },
-  share: "auto",
   provider: {
     opencode: {
       options: {
@@ -74,23 +73,6 @@ const opencodeAgent: Agent.Definition = {
       });
       sessionID = session.id;
       sessionCache.set(cacheKey, sessionID);
-    }
-
-    options.logger.log(`Sharing session ${sessionID}...`);
-    try {
-      const { data, error } = await opencode.client.session.share({
-        path: { id: sessionID! },
-        query: { directory: options.cwd },
-      });
-      if (error) throw error;
-
-      const shareUrl = data.share?.url;
-      options.logger.log(`Share URL: ${shareUrl}`);
-    } catch (e) {
-      options.logger.error(
-        `Failed to enable sharing for session ${sessionID}:`,
-        e,
-      );
     }
 
     options.logger.log(`Prompting session ${sessionID}...`);
