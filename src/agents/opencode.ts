@@ -48,6 +48,7 @@ export const models: string[] = [
   "opencode/kimi-k2",
   "opencode/grok-code",
   "opencode/alpha-gd4",
+  "minimax-cn-coding-plan/MiniMax-M2.7",
 ];
 
 function sessionKey(model: string, cwd: string): string {
