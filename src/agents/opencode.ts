@@ -7,6 +7,7 @@ import {
 import type { Agent } from "./index.js";
 
 // Set OpenCode config before server starts to ensure timeout is applied
+const candidatePrompt = process.env.OPENCODE_BENCH_AGENT_PROMPT;
 const opencodeConfig = {
   permission: {
     edit: "allow",
@@ -22,6 +23,9 @@ const opencodeConfig = {
       },
     },
   },
+  ...(candidatePrompt
+    ? { agent: { build: { prompt: candidatePrompt } } }
+    : {}),
 } satisfies OpencodeConfig;
 
 // CRITICAL: Set via environment variable BEFORE importing/creating anything
@@ -48,6 +52,7 @@ export const models: string[] = [
   "opencode/kimi-k2",
   "opencode/grok-code",
   "opencode/alpha-gd4",
+  "minimax-cn/MiniMax-M2.7",
 ];
 
 function sessionKey(model: string, cwd: string): string {

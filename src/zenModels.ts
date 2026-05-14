@@ -1,4 +1,7 @@
 import { strict as assert } from "node:assert";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAI } from "@ai-sdk/openai";
@@ -11,6 +14,43 @@ type SupportedModel = NonNullable<GenerateObjectOptions["model"]>;
 const DEFAULT_BASE_URL = "https://opencode.ai/zen/v1";
 const OPENCODE_PREFIX = "opencode/";
 const API_KEY_ENV_VARS = ["OPENCODE_API_KEY"];
+
+const MINIMAX_PREFIX = "minimax-cn/";
+const MINIMAX_BASE_URL = "https://api.minimaxi.com/anthropic/v1";
+const MINIMAX_AUTH_PATH = path.join(os.homedir(), ".local", "share", "opencode", "auth.json");
+
+let minimaxAnthropic: ReturnType<typeof createAnthropic> | undefined;
+
+function getMinimaxKey(): string {
+  const fromEnv = process.env.MINIMAX_API_KEY?.trim();
+  if (fromEnv) return fromEnv;
+
+  let raw: string;
+  try {
+    raw = fs.readFileSync(MINIMAX_AUTH_PATH, "utf8");
+  } catch (err) {
+    assert(
+      false,
+      `Cannot read opencode auth file at ${MINIMAX_AUTH_PATH}; set MINIMAX_API_KEY env var or run 'opencode auth login minimax-cn' (${(err as Error).message})`,
+    );
+  }
+  const auth = JSON.parse(raw) as Record<string, { type?: string; key?: string }>;
+  const entry = auth["minimax-cn"];
+  assert(
+    entry?.type === "api" && typeof entry.key === "string" && entry.key.length > 0,
+    `auth.json has no usable 'minimax-cn' api credential; run 'opencode auth login minimax-cn' or set MINIMAX_API_KEY`,
+  );
+  return entry.key as string;
+}
+
+function ensureMinimaxAnthropic(): ReturnType<typeof createAnthropic> {
+  if (minimaxAnthropic) return minimaxAnthropic;
+  minimaxAnthropic = createAnthropic({
+    apiKey: getMinimaxKey(),
+    baseURL: MINIMAX_BASE_URL,
+  });
+  return minimaxAnthropic;
+}
 
 type ProviderBundle = {
   openai: ReturnType<typeof createOpenAI>;
@@ -109,6 +149,17 @@ function inferEndpoint(modelId: string): "responses" | "anthropic" | "chat" {
 }
 
 export function getZenLanguageModel(modelId: string): SupportedModel {
+  const trimmed = modelId.trim();
+  if (trimmed.startsWith(MINIMAX_PREFIX)) {
+    const cacheKey = `minimax:${trimmed}`;
+    const cached = modelCache.get(cacheKey);
+    if (cached) return cached;
+    const minimaxModelName = trimmed.slice(MINIMAX_PREFIX.length);
+    const m = ensureMinimaxAnthropic()(minimaxModelName) as unknown as SupportedModel;
+    modelCache.set(cacheKey, m);
+    return m;
+  }
+
   const normalized = normalizeModelId(modelId);
   const cacheKey = `zen:${normalized}`;
 

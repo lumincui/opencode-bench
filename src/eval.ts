@@ -1,10 +1,12 @@
 import { z } from "zod";
 import { $ } from "bun";
 import { generateObject } from "ai";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, readFile, mkdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { spawn } from "node:child_process";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
+import { Database } from "bun:sqlite";
 import { Logger } from "./util/logger.js";
 import { Task } from "./tasks/index.js";
 import { Agent } from "./agents/index.js";
@@ -16,20 +18,68 @@ import { withRetries } from "./util/retry.js";
 
 export namespace Eval {
   export const DISAGREEMENT_PENALTY = 0.5;
-  export type Result = Awaited<ReturnType<typeof run>>;
+
+  export interface Execution {
+    schema_version: 1;
+    task: string;
+    model: string;
+    agent: string;
+    session_ids: string[];
+    duration_ms: number;
+    usage: { input: number; output: number; cost: number };
+    diff: string;
+    before_results: Record<string, Metric.CommandExecution[]>;
+    after_results: Record<string, Metric.CommandExecution[]>;
+    parts: any[];
+    mechanism: ReturnType<typeof computeMechanismMetricsFromParts>;
+    timestamp: string;
+  }
+
+  export interface Scores {
+    schema_version: 1;
+    judge_set: string[];
+    judge_set_id: string;
+    scored_at: string;
+    criteria: Array<{
+      name: string;
+      weight: number;
+      judges: Array<{ judge: string; score: number; rationale: string }>;
+      average: number;
+      variance: number;
+    }>;
+    score: { base: number; penalty: number; final: number };
+  }
+
+  export type Result = Execution & {
+    score: Scores["score"];
+    scoreDetails: Scores["criteria"];
+  };
 
   export async function run(
     agentName: string,
     modelId: string,
     taskId: string,
-    opts: {
-      logger: Logger.Instance;
-    },
-  ) {
+    opts: { logger: Logger.Instance },
+  ): Promise<Result> {
+    const exec = await execute(agentName, modelId, taskId, opts);
+    const scores = await score(exec, { logger: opts.logger });
+    return {
+      ...exec,
+      score: scores.score,
+      scoreDetails: scores.criteria,
+    };
+  }
+
+  export async function execute(
+    agentName: string,
+    modelId: string,
+    taskId: string,
+    opts: { logger: Logger.Instance },
+  ): Promise<Execution> {
     const timeoutMins = 20;
     opts.logger.log(`Starting episode with ${timeoutMins}min timeout...`);
     return await withRetries(
-      () => runOnce(agentName, modelId, taskId, { logger: opts.logger }),
+      () => executeOnce(agentName, modelId, taskId, { logger: opts.logger }),
       {
         retries: 3,
         timeoutMs: timeoutMins * 60 * 1000,
@@ -38,14 +88,12 @@ export namespace Eval {
     );
   }
 
-  async function runOnce(
+  async function executeOnce(
     agentName: string,
     modelId: string,
     taskId: string,
-    opts: {
-      logger: Logger.Instance;
-    },
-  ) {
+    opts: { logger: Logger.Instance },
+  ): Promise<Execution> {
     const agent = Agent.get(agentName);
     Agent.validateModel(agent, modelId);
     const task = await Task.get(taskId);
@@ -54,7 +102,7 @@ export namespace Eval {
 
     try {
       opts.logger.log(`Cloning repository to ${cwd}...`);
-      await cloneRepositoryAtCommit(task.source.repo, task.source.from);
+      await cloneRepositoryAtCommit(task.source.repo, task.source.from, cwd);
 
       opts.logger.log(`Running pre-task commands...`);
       const beforeResults: Record<string, Metric.CommandExecution[]> = {};
@@ -69,7 +117,7 @@ export namespace Eval {
       opts.logger.log(`Running task...`);
       let duration = 0;
       const usage = { input: 0, output: 0, cost: 0 };
-      const actions: string[] = [];
+      const sessionIds = new Set<string>();
       for (const { commit, prompt } of task.prompts) {
         const cl = opts.logger.child(
           `[prompt ${task.source.repo.split("/")[1]}@${commit.slice(0, 7)}]`,
@@ -82,86 +130,183 @@ export namespace Eval {
         });
         duration += Date.now() - startedAt;
 
-        // Only accumulate usage from the successful result
         usage.input += result.usage.input;
         usage.output += result.usage.output;
         usage.cost += result.usage.cost;
 
-        // Collect actions from this task
-        actions.push(...result.actions);
+        // Extract session ID from first action (the message info)
+        if (result.actions.length > 0) {
+          try {
+            const info = JSON.parse(result.actions[0]);
+            if (info?.sessionID) sessionIds.add(info.sessionID);
+          } catch {}
+        }
       }
 
-      opts.logger.log(`Scoring...`);
+      opts.logger.log(`Finalizing changes...`);
       await finalizeChanges(task.source.from);
       const diff = await generateDiff(task.source.from);
-      const allScores = [];
-      for (const { name, weight, args } of task.metrics) {
+
+      opts.logger.log(`Running post-task commands...`);
+      const afterResults: Record<string, Metric.CommandExecution[]> = {};
+      for (const { name, args } of task.metrics) {
+        if (!args) continue;
         const cl = opts.logger.child(`[metric ${name}]`);
-        const afterResults = args
-          ? await runCommands(args.commands, { logger: cl, cwd })
-          : undefined;
-        const scores = [];
-        for (const judge of Judge.all) {
-          const ccl = cl.child(`[judge ${judge}]`);
-          let result;
-          try {
-            result = await judgeScore(
-              name,
-              judge,
-              {
-                expectedDiff: task.diff,
-                actualDiff: diff,
-                beforeResults: beforeResults[name],
-                afterResults,
-              },
-              { logger: ccl },
-            );
-          } catch (e: any) {
-            result = { score: 0, rationale: String(e.message) };
-          }
-          scores.push({ ...result, judge });
-        }
-        const avg = average(scores.map((s) => s.score));
-        const vrc = variance(
-          avg,
-          scores.map((s) => s.score),
-        );
-        allScores.push({
-          criterion: name,
-          weight,
-          average: avg,
-          variance: vrc,
-          judges: scores,
-        });
+        afterResults[name] = await runCommands(args.commands, { logger: cl, cwd });
       }
 
-      const weightedAvg = weightedSum(
-        allScores.map(({ average, weight }) => ({ value: average, weight })),
+      const sessionIdList = Array.from(sessionIds);
+      const parts = await fetchPartsFromOpencodeDB(sessionIdList, opts.logger);
+      const mechanism = computeMechanismMetricsFromParts(parts);
+      opts.logger.log(
+        `Mechanism: text=${mechanism.text_chars}c reasoning=${mechanism.reasoning_chars}c tools=${mechanism.tool_calls} parts=${mechanism.total_parts}`,
       );
-      const weightedVrc = weightedSum(
-        allScores.map(({ variance, weight }) => ({ value: variance, weight })),
-      );
-      const penalty = DISAGREEMENT_PENALTY * weightedVrc;
-      const score = Math.max(0, weightedAvg - penalty);
-
-      opts.logger.log(`Score: ${score.toFixed(3)}`);
 
       return {
+        schema_version: 1,
         task: taskId,
         model: modelId,
         agent: agentName,
-        score: {
-          final: score,
-          base: weightedAvg,
-          penalty,
-        },
-        scoreDetails: allScores,
-        actions,
+        session_ids: sessionIdList,
+        duration_ms: duration,
         usage,
-        duration,
+        diff,
+        before_results: beforeResults,
+        after_results: afterResults,
+        parts,
+        mechanism,
+        timestamp: new Date().toISOString(),
       };
     } finally {
       await cleanupRepository(cwd, opts.logger);
+    }
+  }
+
+  export async function score(
+    execution: Execution,
+    opts: { logger: Logger.Instance; judgeSet?: string[]; judgeSetId?: string },
+  ): Promise<Scores> {
+    const judgeSet = opts.judgeSet ?? Judge.all;
+    const judgeSetId = opts.judgeSetId ?? "default";
+    const task = await Task.get(execution.task);
+    opts.logger.log(`Scoring with judges: ${judgeSet.join(", ")}`);
+
+    const criteria: Scores["criteria"] = [];
+    for (const { name, weight } of task.metrics) {
+      const cl = opts.logger.child(`[metric ${name}]`);
+      const judgeResults = [];
+      for (const judge of judgeSet) {
+        const ccl = cl.child(`[judge ${judge}]`);
+        let result;
+        try {
+          result = await judgeScore(
+            name,
+            judge,
+            {
+              expectedDiff: task.diff,
+              actualDiff: execution.diff,
+              beforeResults: execution.before_results[name],
+              afterResults: execution.after_results[name],
+            },
+            { logger: ccl },
+          );
+        } catch (e: any) {
+          result = { score: 0, rationale: String(e.message) };
+        }
+        judgeResults.push({ judge, score: result.score, rationale: result.rationale });
+      }
+      const avg = average(judgeResults.map((s) => s.score));
+      const vrc = variance(avg, judgeResults.map((s) => s.score));
+      criteria.push({ name, weight, judges: judgeResults, average: avg, variance: vrc });
+    }
+
+    const base = weightedSum(criteria.map(({ average, weight }) => ({ value: average, weight })));
+    const vrcWeighted = weightedSum(criteria.map(({ variance, weight }) => ({ value: variance, weight })));
+    const penalty = DISAGREEMENT_PENALTY * vrcWeighted;
+    const final = Math.max(0, base - penalty);
+    opts.logger.log(`Score: ${final.toFixed(3)} (base ${base.toFixed(3)} - penalty ${penalty.toFixed(3)})`);
+
+    return {
+      schema_version: 1,
+      judge_set: judgeSet,
+      judge_set_id: judgeSetId,
+      scored_at: new Date().toISOString(),
+      criteria,
+      score: { base, penalty, final },
+    };
+  }
+
+  export async function saveExecution(execution: Execution, dir: string) {
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "execution.json"), JSON.stringify(execution, null, 2));
+    await writeFile(join(dir, "diff.patch"), execution.diff);
+  }
+
+  export async function loadExecution(dir: string): Promise<Execution> {
+    const raw = await readFile(join(dir, "execution.json"), "utf8");
+    return JSON.parse(raw) as Execution;
+  }
+
+  export async function saveScores(scores: Scores, dir: string) {
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "scores.json"), JSON.stringify(scores, null, 2));
+  }
+
+  function computeMechanismMetricsFromParts(parts: any[]) {
+    let textChars = 0;
+    let reasoningChars = 0;
+    let toolCalls = 0;
+    const toolBreakdown: Record<string, number> = {};
+    let totalParts = 0;
+    for (const p of parts) {
+      if (!p || typeof p !== "object" || typeof p.type !== "string") continue;
+      totalParts++;
+      if (p.type === "text" && typeof p.text === "string") textChars += p.text.length;
+      else if (p.type === "reasoning" && typeof p.text === "string") reasoningChars += p.text.length;
+      else if (p.type === "tool") {
+        toolCalls++;
+        const t = typeof p.tool === "string" ? p.tool : "unknown";
+        toolBreakdown[t] = (toolBreakdown[t] ?? 0) + 1;
+      }
+    }
+    return {
+      text_chars: textChars,
+      reasoning_chars: reasoningChars,
+      tool_calls: toolCalls,
+      tool_breakdown: toolBreakdown,
+      total_parts: totalParts,
+    };
+  }
+
+  async function fetchPartsFromOpencodeDB(
+    sessionIds: string[],
+    logger: Logger.Instance,
+  ): Promise<any[]> {
+    if (sessionIds.length === 0) return [];
+    const dbPath = join(homedir(), ".local/share/opencode/opencode.db");
+    if (!existsSync(dbPath)) {
+      logger.log(`opencode.db not found at ${dbPath}, parts will be empty`);
+      return [];
+    }
+    try {
+      const db = new Database(dbPath, { readonly: true });
+      const placeholders = sessionIds.map(() => "?").join(",");
+      const rows = db
+        .query(
+          `SELECT data FROM part WHERE session_id IN (${placeholders}) ORDER BY time_created`,
+        )
+        .all(...sessionIds) as Array<{ data: string }>;
+      db.close();
+      return rows.map((r) => {
+        try {
+          return JSON.parse(r.data);
+        } catch {
+          return null;
+        }
+      }).filter(Boolean);
+    } catch (e) {
+      logger.log(`Failed to fetch parts from opencode.db: ${e instanceof Error ? e.message : e}`);
+      return [];
     }
   }
 
@@ -207,8 +352,8 @@ export namespace Eval {
       if (
         typeof e === "object" &&
         e !== null &&
-        "status" in e &&
-        (e as { status?: number }).status === 1
+        "exitCode" in e &&
+        (e as { exitCode?: number }).exitCode === 1
       ) {
         return true;
       }
@@ -369,12 +514,18 @@ export namespace Eval {
     return `${status} (${exitInfo}, ${duration})${error}`;
   }
 
-  async function cloneRepositoryAtCommit(repo: string, commitSha: string) {
-    await $`git init`.quiet();
-    await $`git remote add origin https://github.com/${repo}.git`.quiet();
-    await $`git fetch --depth 1 origin ${commitSha}`.quiet();
-    await $`git checkout --detach FETCH_HEAD`.quiet();
-    await $`git reset --hard FETCH_HEAD`.quiet();
+  const CACHE_DIR = join(process.cwd(), ".cache", "repos");
+
+  async function cloneRepositoryAtCommit(repo: string, commitSha: string, cwd: string) {
+    const cachedRepo = join(CACHE_DIR, repo);
+    if (existsSync(join(cachedRepo, ".git"))) {
+      await $`cp -R ${cachedRepo}/. ${cwd}/`.quiet();
+      await $`git checkout ${commitSha}`.cwd(cwd).quiet();
+      return;
+    }
+    await $`git clone https://github.com/${repo}.git ${cachedRepo}`.quiet();
+    await $`cp -R ${cachedRepo}/. ${cwd}/`.quiet();
+    await $`git checkout ${commitSha}`.cwd(cwd).quiet();
   }
 
   async function cleanupRepository(

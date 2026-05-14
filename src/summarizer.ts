@@ -23,7 +23,9 @@ export namespace Summarizer {
 
     const task = await Task.get(results[0].task);
     const model = results[0].model;
-    const averageDuration = average(results.map((result) => result.duration));
+    const averageDuration = average(
+      results.map((result) => result.duration_ms),
+    );
     const averageUsage = {
       input: average(results.map((result) => result.usage.input)),
       output: average(results.map((result) => result.usage.output)),
@@ -72,7 +74,7 @@ Model: ${model}
 Task: Implement changes from ${task.source.from} to ${task.source.to}
 
 ${results
-  .map((result) => result.actions)
+  .map((result) => partsToActionStrings(result.parts))
   .flatMap((actions, i) => {
     const len = actions.length;
     return [
@@ -105,6 +107,27 @@ Provide a concise summary of what the agent did across these episodes.`.trim(),
       summary,
       runs: results,
     };
+  }
+
+  function partsToActionStrings(parts: any[]): string[] {
+    if (!Array.isArray(parts)) return [];
+    return parts
+      .map((p) => {
+        if (!p || typeof p !== "object") return null;
+        if (p.type === "text" && typeof p.text === "string") {
+          return `text: ${p.text.slice(0, 200)}`;
+        }
+        if (p.type === "reasoning" && typeof p.text === "string") {
+          return `reasoning: ${p.text.slice(0, 200)}`;
+        }
+        if (p.type === "tool") {
+          const tool = typeof p.tool === "string" ? p.tool : "unknown";
+          const arg = p.arg ? ` ${JSON.stringify(p.arg).slice(0, 200)}` : "";
+          return `tool ${tool}${arg}`;
+        }
+        return `${p.type ?? "part"}`;
+      })
+      .filter((s): s is string => typeof s === "string");
   }
 
   export async function summarizeTasks(results: RunsResult[]) {
