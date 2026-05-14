@@ -3,11 +3,12 @@ import { $ } from "bun";
 import { generateObject } from "ai";
 import { mkdtemp, rm, writeFile, readFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { tmpdir, homedir } from "node:os";
 import { Database } from "bun:sqlite";
 import { Logger } from "./util/logger.js";
+import { fileExists } from "./util/fs.js";
 import { Task } from "./tasks/index.js";
 import { Agent } from "./agents/index.js";
 import { Metric } from "./metrics/index.js";
@@ -102,7 +103,11 @@ export namespace Eval {
 
     try {
       opts.logger.log(`Cloning repository to ${cwd}...`);
-      await cloneRepositoryAtCommit(task.source.repo, task.source.from, cwd);
+      await cloneRepositoryAtCommit(
+        task.source.repo,
+        task.source.from,
+        opts.logger,
+      );
 
       opts.logger.log(`Running pre-task commands...`);
       const beforeResults: Record<string, Metric.CommandExecution[]> = {};
@@ -514,18 +519,72 @@ export namespace Eval {
     return `${status} (${exitInfo}, ${duration})${error}`;
   }
 
-  const CACHE_DIR = join(process.cwd(), ".cache", "repos");
+  async function cloneRepositoryAtCommit(
+    repo: string,
+    commitSha: string,
+    logger: Logger.Instance,
+  ) {
+    const cacheRoot = await resolveRepoCacheRoot(logger);
+    let originUrl: string;
+    if (cacheRoot) {
+      const cachePath = join(cacheRoot, repo);
+      await ensureCacheRepo(cachePath, repo, commitSha, logger);
+      originUrl = cachePath;
+    } else {
+      originUrl = `https://github.com/${repo}.git`;
+    }
 
-  async function cloneRepositoryAtCommit(repo: string, commitSha: string, cwd: string) {
-    const cachedRepo = join(CACHE_DIR, repo);
-    if (existsSync(join(cachedRepo, ".git"))) {
-      await $`cp -R ${cachedRepo}/. ${cwd}/`.quiet();
-      await $`git checkout ${commitSha}`.cwd(cwd).quiet();
+    await $`git init`.quiet();
+    await $`git remote add origin ${originUrl}`.quiet();
+    await $`git fetch --depth 1 origin ${commitSha}`.quiet();
+    await $`git checkout --detach FETCH_HEAD`.quiet();
+    await $`git reset --hard FETCH_HEAD`.quiet();
+  }
+
+  async function resolveRepoCacheRoot(
+    logger: Logger.Instance,
+  ): Promise<string | null> {
+    const envPath = process.env.OPENREVAL_REPO_CACHE;
+    if (envPath) {
+      const expanded = resolve(envPath);
+      if (await fileExists(expanded)) return expanded;
+      logger.error(
+        `OPENREVAL_REPO_CACHE=${envPath} does not exist; falling back to direct GitHub clone`,
+      );
+      return null;
+    }
+    let dir = process.cwd();
+    for (let i = 0; i < 8; i++) {
+      const candidate = join(dir, ".cache", "repos");
+      if (await fileExists(candidate)) return candidate;
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    return null;
+  }
+
+  async function ensureCacheRepo(
+    cachePath: string,
+    repo: string,
+    commitSha: string,
+    logger: Logger.Instance,
+  ): Promise<void> {
+    const gitDir = join(cachePath, ".git");
+    if (!(await fileExists(gitDir))) {
+      logger.log(`Repo cache miss; cloning ${repo} into ${cachePath}...`);
+      await mkdir(dirname(cachePath), { recursive: true });
+      await $`git clone https://github.com/${repo}.git ${cachePath}`.quiet();
       return;
     }
-    await $`git clone https://github.com/${repo}.git ${cachedRepo}`.quiet();
-    await $`cp -R ${cachedRepo}/. ${cwd}/`.quiet();
-    await $`git checkout ${commitSha}`.cwd(cwd).quiet();
+    const probe = await $`git -C ${cachePath} cat-file -e ${commitSha}^{commit}`
+      .nothrow()
+      .quiet();
+    if (probe.exitCode === 0) return;
+    logger.log(
+      `Commit ${commitSha.slice(0, 7)} missing in cache for ${repo}; fetching from origin...`,
+    );
+    await $`git -C ${cachePath} fetch --no-tags origin`.quiet();
   }
 
   async function cleanupRepository(
